@@ -1,0 +1,7 @@
+/* Soft Text Color — Editor & Menu Styles */
+.stc-colored-text,
+.cm-line .stc-colored-text,
+.cm-s-obsidian .stc-colored-text {
+  color: var(--stc-color) !important;
+  border-radius: 2px;
+}
