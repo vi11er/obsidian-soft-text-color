@@ -25,10 +25,12 @@ function sanitizeColor(raw) {
   return null;
 }
 
-function buildSpanDecorations(doc) {
-  const builder = new RangeSetBuilder();
+function buildSpanState(doc) {
+  const decoBuilder = new RangeSetBuilder();
+  const atomicBuilder = new RangeSetBuilder();
   const text = doc.toString();
-  const ops = [];
+  const decoOps = [];
+  const atomicOps = [];
 
   SPAN_COLOR_REGEX.lastIndex = 0;
   let match;
@@ -46,16 +48,14 @@ function buildSpanDecorations(doc) {
     const closeStart = openEnd + innerText.length;
     const closeEnd = closeStart + closeTag.length;
 
-    // Hide opening <span ...> completely
-    ops.push({
-      from: fullStart,
-      to: openEnd,
-      deco: Decoration.replace({}),
-    });
+    // Hide opening <span ...> completely and mark it atomic for seamless cursor navigation
+    const hideOpen = Decoration.replace({});
+    decoOps.push({ from: fullStart, to: openEnd, deco: hideOpen });
+    atomicOps.push({ from: fullStart, to: openEnd, deco: hideOpen });
 
     // Color the inner text directly in editor
     if (closeStart > openEnd) {
-      ops.push({
+      decoOps.push({
         from: openEnd,
         to: closeStart,
         deco: Decoration.mark({
@@ -65,33 +65,43 @@ function buildSpanDecorations(doc) {
       });
     }
 
-    // Hide closing </span> completely
-    ops.push({
-      from: closeStart,
-      to: closeEnd,
-      deco: Decoration.replace({}),
-    });
+    // Hide closing </span> completely and mark it atomic for seamless cursor navigation
+    const hideClose = Decoration.replace({});
+    decoOps.push({ from: closeStart, to: closeEnd, deco: hideClose });
+    atomicOps.push({ from: closeStart, to: closeEnd, deco: hideClose });
   }
 
-  ops.sort((a, b) => a.from - b.from || a.to - b.to);
-  for (const op of ops) {
-    builder.add(op.from, op.to, op.deco);
+  decoOps.sort((a, b) => a.from - b.from || a.to - b.to);
+  for (const op of decoOps) {
+    decoBuilder.add(op.from, op.to, op.deco);
   }
-  return builder.finish();
+
+  atomicOps.sort((a, b) => a.from - b.from || a.to - b.to);
+  for (const op of atomicOps) {
+    atomicBuilder.add(op.from, op.to, op.deco);
+  }
+
+  return {
+    decorations: decoBuilder.finish(),
+    atomicRanges: atomicBuilder.finish(),
+  };
 }
 
 function buildHiddenSpanExtension() {
   return StateField.define({
     create(state) {
-      return buildSpanDecorations(state.doc);
+      return buildSpanState(state.doc);
     },
-    update(decorations, tr) {
+    update(value, tr) {
       if (tr.docChanged) {
-        return buildSpanDecorations(tr.state.doc);
+        return buildSpanState(tr.state.doc);
       }
-      return decorations;
+      return value;
     },
-    provide: (field) => EditorView.decorations.from(field),
+    provide: (field) => [
+      EditorView.decorations.from(field, (v) => v.decorations),
+      EditorView.atomicRanges.from(field, (v) => v.atomicRanges),
+    ],
   });
 }
 
