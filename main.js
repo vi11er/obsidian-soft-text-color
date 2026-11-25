@@ -1,8 +1,8 @@
 'use strict';
 
 const { Plugin, addIcon } = require('obsidian');
-const { ViewPlugin, Decoration } = require('@codemirror/view');
-const { RangeSetBuilder } = require('@codemirror/state');
+const { EditorView, Decoration } = require('@codemirror/view');
+const { StateField, RangeSetBuilder } = require('@codemirror/state');
 
 const SOFT_COLORS = [
   { id: 'soft-purple', name: 'Нежно-фиолетовый', hex: '#9b7ede' },
@@ -25,81 +25,74 @@ function sanitizeColor(raw) {
   return null;
 }
 
-function buildHiddenSpanExtension() {
-  return ViewPlugin.fromClass(
-    class {
-      constructor(view) {
-        this.decorations = this.buildDecorations(view);
-      }
+function buildSpanDecorations(doc) {
+  const builder = new RangeSetBuilder();
+  const text = doc.toString();
+  const ops = [];
 
-      update(update) {
-        if (update.docChanged || update.viewportChanged) {
-          this.decorations = this.buildDecorations(update.view);
-        }
-      }
+  SPAN_COLOR_REGEX.lastIndex = 0;
+  let match;
+  while ((match = SPAN_COLOR_REGEX.exec(text)) !== null) {
+    const fullStart = match.index;
+    const openTag = match[1];
+    const rawColor = match[2];
+    const innerText = match[3];
+    const closeTag = match[4];
 
-      buildDecorations(view) {
-        const builder = new RangeSetBuilder();
-        const doc = view.state.doc;
-        const ops = [];
+    const color = sanitizeColor(rawColor);
+    if (!color) continue;
 
-        for (const { from, to } of view.visibleRanges) {
-          const text = doc.sliceString(from, to);
-          SPAN_COLOR_REGEX.lastIndex = 0;
-          let match;
-          while ((match = SPAN_COLOR_REGEX.exec(text)) !== null) {
-            const fullStart = from + match.index;
-            const openTag = match[1];
-            const rawColor = match[2];
-            const innerText = match[3];
-            const closeTag = match[4];
+    const openEnd = fullStart + openTag.length;
+    const closeStart = openEnd + innerText.length;
+    const closeEnd = closeStart + closeTag.length;
 
-            const color = sanitizeColor(rawColor);
-            if (!color) continue;
+    // Hide opening <span ...> completely
+    ops.push({
+      from: fullStart,
+      to: openEnd,
+      deco: Decoration.replace({}),
+    });
 
-            const openEnd = fullStart + openTag.length;
-            const closeStart = openEnd + innerText.length;
-            const closeEnd = closeStart + closeTag.length;
-
-            // Hide opening <span ...> completely
-            ops.push({
-              from: fullStart,
-              to: openEnd,
-              deco: Decoration.replace({}),
-            });
-
-            // Color the inner text directly in editor
-            if (closeStart > openEnd) {
-              ops.push({
-                from: openEnd,
-                to: closeStart,
-                deco: Decoration.mark({
-                  cls: 'stc-colored-text',
-                  attributes: { style: `--stc-color: ${color}; color: ${color};` },
-                }),
-              });
-            }
-
-            // Hide closing </span> completely
-            ops.push({
-              from: closeStart,
-              to: closeEnd,
-              deco: Decoration.replace({}),
-            });
-          }
-        }
-
-        ops.sort((a, b) => a.from - b.from || a.to - b.to);
-        for (const op of ops) {
-          builder.add(op.from, op.to, op.deco);
-        }
-        return builder.finish();
-      }
-    },
-    {
-      decorations: (v) => v.decorations,
+    // Color the inner text directly in editor
+    if (closeStart > openEnd) {
+      ops.push({
+        from: openEnd,
+        to: closeStart,
+        deco: Decoration.mark({
+          cls: 'stc-colored-text',
+          attributes: { style: `--stc-color: ${color}; color: ${color};` },
+        }),
+      });
     }
-  );
+
+    // Hide closing </span> completely
+    ops.push({
+      from: closeStart,
+      to: closeEnd,
+      deco: Decoration.replace({}),
+    });
+  }
+
+  ops.sort((a, b) => a.from - b.from || a.to - b.to);
+  for (const op of ops) {
+    builder.add(op.from, op.to, op.deco);
+  }
+  return builder.finish();
+}
+
+function buildHiddenSpanExtension() {
+  return StateField.define({
+    create(state) {
+      return buildSpanDecorations(state.doc);
+    },
+    update(decorations, tr) {
+      if (tr.docChanged) {
+        return buildSpanDecorations(tr.state.doc);
+      }
+      return decorations;
+    },
+    provide: (field) => EditorView.decorations.from(field),
+  });
 }
 
 function findAllColorSpans(text) {
@@ -138,12 +131,23 @@ function stripColorSpans(segment) {
  * Applies or clears color cleanly for cursor, partial selection inside a span,
  * full span selection, or multi-span/overlapping selection.
  */
-function applyOrClearColorInEditor(editor, targetHex) {
+function applyOrClearColorInEditor(editor, targetHex, clickCoords = null) {
   const fullText = editor.getValue();
-  const fromPos = editor.getCursor('from');
-  const toPos = editor.getCursor('to');
+  let fromPos = editor.getCursor('from');
+  let toPos = editor.getCursor('to');
   let selFrom = editor.posToOffset(fromPos);
   let selTo = editor.posToOffset(toPos);
+
+  // If no text is selected, prefer the exact position under the right-click mouse coordinates
+  if (selFrom === selTo && clickCoords && editor.cm && typeof editor.cm.posAtCoords === 'function') {
+    const mouseOffset = editor.cm.posAtCoords({ x: clickCoords.x, y: clickCoords.y });
+    if (typeof mouseOffset === 'number' && mouseOffset >= 0 && mouseOffset <= fullText.length) {
+      selFrom = mouseOffset;
+      selTo = mouseOffset;
+      fromPos = editor.offsetToPos(mouseOffset);
+      toPos = fromPos;
+    }
+  }
   const spans = findAllColorSpans(fullText);
 
   // Case 1: Empty selection (cursor only)
@@ -250,12 +254,26 @@ module.exports = class SoftTextColorPlugin extends Plugin {
       );
     }
 
-    // Register CodeMirror 6 extension that hides <span style="color:..."> and </span> at all times
+    // Register CodeMirror 6 StateField that hides <span style="color:..."> and </span> reliably
     this.registerEditorExtension(buildHiddenSpanExtension());
+
+    // Track exact right-click coordinates so un-selected right-clicks target the word under mouse
+    this.lastContextCoords = null;
+    this.registerDomEvent(document, 'contextmenu', (evt) => {
+      this.lastContextCoords = { x: evt.clientX, y: evt.clientY, ts: Date.now() };
+    });
+
+    const getRecentCoords = () => {
+      if (this.lastContextCoords && Date.now() - this.lastContextCoords.ts < 10000) {
+        return this.lastContextCoords;
+      }
+      return null;
+    };
 
     // Add right-click context menu item with submenu
     this.registerEvent(
       this.app.workspace.on('editor-menu', (menu, editor) => {
+        const coordsSnapshot = getRecentCoords();
         menu.addItem((item) => {
           item.setTitle('Цвет текста').setIcon('palette');
 
@@ -267,7 +285,7 @@ module.exports = class SoftTextColorPlugin extends Plugin {
                   .setTitle(c.name)
                   .setIcon(`stc-dot-${c.id}`)
                   .onClick(() => {
-                    applyOrClearColorInEditor(editor, c.hex);
+                    applyOrClearColorInEditor(editor, c.hex, coordsSnapshot);
                   });
               });
             }
@@ -277,13 +295,13 @@ module.exports = class SoftTextColorPlugin extends Plugin {
                 .setTitle('Сбросить цвет')
                 .setIcon('eraser')
                 .onClick(() => {
-                  applyOrClearColorInEditor(editor, null);
+                  applyOrClearColorInEditor(editor, null, coordsSnapshot);
                 });
             });
           } else {
             // Fallback if setSubmenu is not supported
             item.onClick(() => {
-              applyOrClearColorInEditor(editor, SOFT_COLORS[0].hex);
+              applyOrClearColorInEditor(editor, SOFT_COLORS[0].hex, coordsSnapshot);
             });
           }
         });
