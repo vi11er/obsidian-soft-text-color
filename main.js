@@ -102,9 +102,41 @@ function buildHiddenSpanExtension() {
   );
 }
 
+function findAllColorSpans(text) {
+  const spans = [];
+  SPAN_COLOR_REGEX.lastIndex = 0;
+  let match;
+  while ((match = SPAN_COLOR_REGEX.exec(text)) !== null) {
+    const spanStart = match.index;
+    const openEnd = spanStart + match[1].length;
+    const closeStart = openEnd + match[3].length;
+    const spanEnd = closeStart + match[4].length;
+    spans.push({
+      spanStart,
+      openTag: match[1],
+      openEnd,
+      color: sanitizeColor(match[2]) || match[2].trim(),
+      inner: match[3],
+      closeStart,
+      spanEnd,
+    });
+  }
+  return spans;
+}
+
+function stripColorSpans(segment) {
+  let out = segment;
+  let prev;
+  do {
+    prev = out;
+    out = out.replace(SPAN_COLOR_REGEX, '$3');
+  } while (out !== prev);
+  return out;
+}
+
 /**
- * Finds if [selFrom, selTo] is inside or tightly wrapped by an existing <span style="color:...">...</span>
- * and applies or clears the color cleanly without nested tags.
+ * Applies or clears color cleanly for cursor, partial selection inside a span,
+ * full span selection, or multi-span/overlapping selection.
  */
 function applyOrClearColorInEditor(editor, targetHex) {
   const fullText = editor.getValue();
@@ -112,47 +144,100 @@ function applyOrClearColorInEditor(editor, targetHex) {
   const toPos = editor.getCursor('to');
   let selFrom = editor.posToOffset(fromPos);
   let selTo = editor.posToOffset(toPos);
+  const spans = findAllColorSpans(fullText);
 
-  // Check if selection/cursor is inside or adjacent to an existing color span
-  SPAN_COLOR_REGEX.lastIndex = 0;
-  let match;
-  while ((match = SPAN_COLOR_REGEX.exec(fullText)) !== null) {
-    const spanStart = match.index;
-    const openEnd = spanStart + match[1].length;
-    const closeStart = openEnd + match[3].length;
-    const spanEnd = closeStart + match[4].length;
-
-    // Case 1: User selected the exact visible text (or part/all with hidden tags)
-    const coversWholeInner = selFrom <= openEnd && selTo >= closeStart && selFrom >= spanStart && selTo <= spanEnd;
-    // Case 2: No text selected, cursor is simply inside a colored word/span
-    const cursorInside = selFrom === selTo && selFrom >= spanStart && selTo <= spanEnd;
-
-    if (coversWholeInner || cursorInside) {
-      selFrom = spanStart;
-      selTo = spanEnd;
-      break;
-    }
-  }
-
+  // Case 1: Empty selection (cursor only)
   if (selFrom === selTo) {
-    // Nothing selected and cursor not inside an existing color span: try selecting word under cursor
+    const inside = spans.find((s) => selFrom >= s.spanStart && selFrom <= s.spanEnd);
+    if (inside) {
+      const cleaned = stripColorSpans(inside.inner);
+      const replacement = targetHex
+        ? `<span style="color: ${targetHex}">${cleaned}</span>`
+        : cleaned;
+      editor.replaceRange(
+        replacement,
+        editor.offsetToPos(inside.spanStart),
+        editor.offsetToPos(inside.spanEnd)
+      );
+      return;
+    }
     const wordRange = editor.wordAt(fromPos);
     if (!wordRange) return;
     selFrom = editor.posToOffset(wordRange.from);
     selTo = editor.posToOffset(wordRange.to);
   }
 
-  const rawSegment = fullText.slice(selFrom, selTo);
-  // Strip any existing color spans inside the selected range to prevent nesting
-  const strippedSegment = rawSegment.replace(SPAN_COLOR_REGEX, '$3');
+  // Case 2: Selection is strictly inside a single colored span's inner text
+  const enclosing = spans.find((s) => selFrom >= s.spanStart && selTo <= s.spanEnd);
+  if (enclosing) {
+    const innerSelFrom = Math.max(selFrom, enclosing.openEnd);
+    const innerSelTo = Math.min(selTo, enclosing.closeStart);
+    const before = fullText.slice(enclosing.openEnd, innerSelFrom);
+    const middle = stripColorSpans(fullText.slice(innerSelFrom, innerSelTo));
+    const after = fullText.slice(innerSelTo, enclosing.closeStart);
+
+    // If user selected effectively the whole span (ignoring leading/trailing spaces)
+    if (before.trim() === '' && after.trim() === '') {
+      const wholeInner = stripColorSpans(enclosing.inner);
+      const replacement = targetHex
+        ? `<span style="color: ${targetHex}">${wholeInner}</span>`
+        : wholeInner;
+      editor.replaceRange(
+        replacement,
+        editor.offsetToPos(enclosing.spanStart),
+        editor.offsetToPos(enclosing.spanEnd)
+      );
+      return;
+    }
+
+    // Split the span cleanly around the selected substring
+    let replacement = '';
+    if (before) replacement += `<span style="color: ${enclosing.color}">${before}</span>`;
+    replacement += targetHex ? `<span style="color: ${targetHex}">${middle}</span>` : middle;
+    if (after) replacement += `<span style="color: ${enclosing.color}">${after}</span>`;
+
+    editor.replaceRange(
+      replacement,
+      editor.offsetToPos(enclosing.spanStart),
+      editor.offsetToPos(enclosing.spanEnd)
+    );
+    return;
+  }
+
+  // Case 3: Selection overlaps one or more spans (e.g. includes spaces or crosses span boundaries)
+  let effFrom = selFrom;
+  let effTo = selTo;
+  for (const s of spans) {
+    if (s.spanStart < effTo && s.spanEnd > effFrom) {
+      if (effFrom < s.openEnd || effFrom > s.spanStart && effFrom < s.openEnd) {
+        effFrom = Math.min(effFrom, s.spanStart);
+      }
+      if (effTo > s.closeStart || (effFrom <= s.openEnd && effTo >= s.closeStart)) {
+        effTo = Math.max(effTo, s.spanEnd);
+      }
+      // If selection starts inside a span's text and exits past its end, include the whole span
+      if (effFrom > s.spanStart && effFrom < s.spanEnd && effTo >= s.spanEnd) {
+        effFrom = Math.min(effFrom, s.spanStart);
+      }
+      // If selection starts before a span and ends inside its text, include the whole span
+      if (effFrom <= s.spanStart && effTo > s.spanStart && effTo < s.spanEnd) {
+        effTo = Math.max(effTo, s.spanEnd);
+      }
+    }
+  }
+
+  const rawSegment = fullText.slice(effFrom, effTo);
+  const strippedSegment = stripColorSpans(rawSegment);
 
   const replacement = targetHex
     ? `<span style="color: ${targetHex}">${strippedSegment}</span>`
     : strippedSegment;
 
-  const replaceFrom = editor.offsetToPos(selFrom);
-  const replaceTo = editor.offsetToPos(selTo);
-  editor.replaceRange(replacement, replaceFrom, replaceTo);
+  editor.replaceRange(
+    replacement,
+    editor.offsetToPos(effFrom),
+    editor.offsetToPos(effTo)
+  );
 }
 
 module.exports = class SoftTextColorPlugin extends Plugin {

@@ -1,7 +1,7 @@
 {
   "id": "obsidian-soft-text-color",
   "name": "Soft Text Color (Hidden Span)",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "minAppVersion": "1.4.0",
   "description": "Смена цвета текста через правый клик мыши (мягкая палитра) с полным скрытием тегов <span> в режиме редактирования.",
   "author": "Antigravity",
