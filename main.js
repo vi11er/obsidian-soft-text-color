@@ -108,6 +108,28 @@ function findWordBoundsAt(text, pos, minBound, maxBound) {
   return { start, end };
 }
 
+function getExactOffsetInSpanWidget(event, view, span, text) {
+  const widgetRoot = event.target instanceof Element
+    ? event.target.closest('.cm-html-embed, [contenteditable="false"]')
+    : null;
+  if (!widgetRoot || typeof document.caretRangeFromPoint !== 'function') {
+    return null;
+  }
+  const range = document.caretRangeFromPoint(event.clientX, event.clientY);
+  if (!range || !widgetRoot.contains(range.startContainer)) {
+    return null;
+  }
+  const preRange = document.createRange();
+  preRange.selectNodeContents(widgetRoot);
+  preRange.setEnd(range.startContainer, range.startOffset);
+  const offsetInVisible = preRange.toString().length;
+  const candidate = span.openEnd + offsetInVisible;
+  if (candidate >= span.openEnd && candidate <= span.closeStart) {
+    return candidate;
+  }
+  return null;
+}
+
 function buildHiddenSpanExtension() {
   const spanStateField = StateField.define({
     create(state) {
@@ -138,7 +160,9 @@ function buildHiddenSpanExtension() {
       const span = spans.find((s) => pos >= s.spanStart && pos <= s.spanEnd);
       if (!span) return false;
 
-      const bounds = findWordBoundsAt(text, pos, span.openEnd, span.closeStart);
+      const widgetPos = getExactOffsetInSpanWidget(event, view, span, text);
+      const targetPos = widgetPos != null ? widgetPos : pos;
+      const bounds = findWordBoundsAt(text, targetPos, span.openEnd, span.closeStart);
       if (!bounds) return false;
 
       event.preventDefault();
@@ -149,7 +173,9 @@ function buildHiddenSpanExtension() {
     },
   });
 
-  return [Prec.highest(spanStateField), Prec.highest(wordDblClickHandler)];
+  // Do NOT wrap spanStateField in Prec.highest: Obsidian's Live Preview replace widgets
+  // conflict with Prec.highest(Decoration.replace) and can collapse inner text.
+  return [spanStateField, Prec.highest(wordDblClickHandler)];
 }
 
 function findAllColorSpans(text) {
