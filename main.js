@@ -2,7 +2,7 @@
 
 const { Plugin, addIcon } = require('obsidian');
 const { EditorView, Decoration } = require('@codemirror/view');
-const { StateField, RangeSetBuilder } = require('@codemirror/state');
+const { StateField, RangeSetBuilder, EditorSelection, Prec } = require('@codemirror/state');
 
 const SOFT_COLORS = [
   { id: 'soft-purple', name: 'Нежно-фиолетовый', hex: '#9b7ede' },
@@ -87,8 +87,29 @@ function buildSpanState(doc) {
   };
 }
 
+function findWordBoundsAt(text, pos, minBound, maxBound) {
+  const wordChar = /[\p{L}\p{N}_]/u;
+  const clamped = Math.max(minBound, Math.min(pos, maxBound));
+
+  // Pick character at clamped or immediately before it
+  let idx = clamped;
+  if (idx >= maxBound || !wordChar.test(text[idx])) {
+    if (idx > minBound && wordChar.test(text[idx - 1])) {
+      idx -= 1;
+    } else {
+      return null;
+    }
+  }
+
+  let start = idx;
+  let end = idx + 1;
+  while (start > minBound && wordChar.test(text[start - 1])) start--;
+  while (end < maxBound && wordChar.test(text[end])) end++;
+  return { start, end };
+}
+
 function buildHiddenSpanExtension() {
-  return StateField.define({
+  const spanStateField = StateField.define({
     create(state) {
       return buildSpanState(state.doc);
     },
@@ -103,6 +124,32 @@ function buildHiddenSpanExtension() {
       EditorView.atomicRanges.from(field, (v) => v.atomicRanges),
     ],
   });
+
+  // Override Obsidian's HTML widget double-click so double-clicking inside colored text
+  // selects only the single word under the cursor, matching plain text behavior.
+  const wordDblClickHandler = EditorView.domEventHandlers({
+    mousedown(event, view) {
+      if (event.button !== 0 || event.detail !== 2) return false;
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
+      if (pos == null) return false;
+
+      const text = view.state.doc.toString();
+      const spans = findAllColorSpans(text);
+      const span = spans.find((s) => pos >= s.spanStart && pos <= s.spanEnd);
+      if (!span) return false;
+
+      const bounds = findWordBoundsAt(text, pos, span.openEnd, span.closeStart);
+      if (!bounds) return false;
+
+      event.preventDefault();
+      view.dispatch({
+        selection: EditorSelection.range(bounds.start, bounds.end),
+      });
+      return true;
+    },
+  });
+
+  return [Prec.highest(spanStateField), Prec.highest(wordDblClickHandler)];
 }
 
 function findAllColorSpans(text) {
